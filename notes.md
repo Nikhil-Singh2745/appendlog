@@ -102,6 +102,48 @@ an error. Recovery keeps a complete checksum-valid record and syncs it. The call
 must handle duplicate retries if that matters to the application. Multi-record
 transactions and exactly-once delivery aren't provided here.
 
+## Group commit
+
+I kept the single-file writer and put the batching policy above it. One worker
+owns a `Manual` writer; producers only own queue senders. This keeps file offsets
+and poison handling in one place. No async runtime or additional dependencies.
+
+```text
+submit A -> queue -> append A --+
+submit B -> queue -> append B --+-> sync_all -> reply A, reply B
+```
+
+The first dequeued request starts a collection window. The worker stops collecting
+at the record cap, the window's deadline, or a shutdown marker. It doesn't reset
+the deadline when another record arrives, so a steady producer can't postpone
+the barrier forever. An idle worker waits without syncing. A zero window removes
+the deliberate wait; an already queued request may still join the batch.
+
+The defaults cap queued payloads at 128 MiB and the batch at 64 MiB, before
+allocation and channel overhead. Each blocked submitting thread can also hold
+one copied payload outside the queue. Receipts retained by callers consume memory
+too. This bounds the worker's payload backlog, not total process memory; producer
+counts and retained receipts still need an application-level limit.
+
+Submission and acknowledgment are separate. `submit` only transfers work to the
+queue; `Commit::wait` returns an offset after sync succeeds. Batches share a
+barrier, not a transaction: a failed batch may leave a valid prefix, or even all
+its records, on disk. Dropping a receipt doesn't remove its request.
+
+An append or sync failure rejects every receipt in the current batch with the
+same storage error, including records not attempted yet. The worker exits instead
+of continuing after ambiguous I/O. Queued receipts then receive `Closed`; an
+unexpected worker panic has the same effect on receipts. Explicit shutdown also
+reports the worker's storage error or panic. Retry still requires deduplication
+outside this format.
+
+Shutdown uses a marker in the same queue. Requests ahead of it finish; requests
+behind it are dropped without acknowledgment. A submission racing shutdown may
+enqueue successfully and then receive `Closed`, so producers should finish first.
+The owner joins its worker, ensuring the file lock is released even if appender
+clones remain alive. `Drop` does the same work and can block on disk I/O, but discards
+the result. `shutdown` is the path for observing errors.
+
 ## What the tests establish
 
 The recovery tests cut the final record at every byte boundary, inspect without
@@ -117,12 +159,19 @@ CLI tests run another process while a parent handle holds a lock. This checks
 that exclusion isn't just enforced by mutable Rust references.
 
 The process-crash tests kill a writer with SIGKILL after it reports three records
-past a sync barrier: per-record sync with `Always`, or an explicit batch sync with
-`Manual`. The parent checks exclusion before the kill, then verifies the exact
-records and offsets, no discarded tail, and an append at the recovered boundary.
+past a sync barrier: per-record sync with `Always`, an explicit batch sync with
+`Manual`, or successful group-commit receipts. The parent checks exclusion before
+the kill, then verifies the exact records and offsets, no discarded tail, and an
+append at the recovered boundary.
 A pipe handshake fixes the kill point; it doesn't depend on a sleep. This covers
 lock release and reopening after process death. The kernel stays running, so it
 doesn't establish power-loss durability or exercise a kill halfway through a write.
+
+The group worker also runs against a private test sink. One test holds its sync
+barrier blocked and checks that all receipts remain pending. Others count syncs
+across bounded batches and inject append or sync failures. Integration tests use
+four concurrent producers with a queue smaller than their combined workload,
+then compare every acknowledged offset and payload with the file in order.
 
 There are no benchmark numbers yet. The next useful performance question is the
 cost of one sync per append against explicit batches, using a stated filesystem,

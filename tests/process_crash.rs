@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use appendlog::{Error, Reader, SyncPolicy, Writer};
+use appendlog::{Error, GroupOptions, GroupWriter, Reader, SyncPolicy, Writer};
 use support::Workspace;
 
 const PAYLOADS: [&[u8]; 3] = [b"first", b"", b"\0\xff\n"];
@@ -34,6 +34,11 @@ fn always_acknowledged_records_survive_a_killed_writer() {
 #[test]
 fn manually_synced_records_survive_a_killed_writer() {
     acknowledged_prefix_survives("manual");
+}
+
+#[test]
+fn group_committed_records_survive_a_killed_writer() {
+    acknowledged_prefix_survives("group");
 }
 
 fn acknowledged_prefix_survives(policy: &str) {
@@ -128,7 +133,21 @@ fn acknowledged_prefix_survives(policy: &str) {
 #[ignore = "subprocess helper, started by the crash tests"]
 fn writer_process() {
     let path = std::env::var_os("APPENDLOG_TEST_PATH").expect("child log path");
-    let policy = match std::env::var("APPENDLOG_TEST_POLICY").unwrap().as_str() {
+    let policy = std::env::var("APPENDLOG_TEST_POLICY").unwrap();
+    if policy == "group" {
+        let (writer, _) = GroupWriter::open(path, GroupOptions::default()).unwrap();
+        let appender = writer.appender();
+        let commits: Vec<_> = PAYLOADS
+            .iter()
+            .map(|payload| appender.submit(payload).unwrap())
+            .collect();
+        let offsets: Vec<_> = commits
+            .into_iter()
+            .map(|commit| commit.wait().unwrap().to_string())
+            .collect();
+        wait_for_kill(&offsets);
+    }
+    let policy = match policy.as_str() {
         "always" => SyncPolicy::Always,
         "manual" => SyncPolicy::Manual,
         other => panic!("unknown sync policy: {other}"),
@@ -141,7 +160,10 @@ fn writer_process() {
     if policy == SyncPolicy::Manual {
         writer.sync().unwrap();
     }
+    wait_for_kill(&offsets);
+}
 
+fn wait_for_kill(offsets: &[String]) -> ! {
     // Start a fresh line after libtest's output, then acknowledge the barrier.
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "\n{READY}{}", offsets.join(",")).unwrap();
@@ -151,6 +173,5 @@ fn writer_process() {
     io::stdin()
         .read_exact(&mut [0])
         .expect("parent keeps stdin open");
-    drop(writer);
     panic!("parent should kill the writer while it holds the lock");
 }

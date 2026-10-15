@@ -78,6 +78,51 @@ validated file and its parent directory before returning.
 A write or sync error disables that writer. Close it and reopen to recover. A
 failed append can still leave a complete record, so retrying may duplicate it.
 
+## Group commit
+
+`GroupWriter` owns one background writer. Clone its `GroupAppender` handles for
+concurrent producers; they share a bounded queue. Each batch writes with `Manual`
+and syncs once before replying to any caller. The on-disk format stays the same.
+
+```rust
+use appendlog::{GroupOptions, GroupWriter};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (writer, _) = GroupWriter::open("events.alog", GroupOptions::default())?;
+    let appender = writer.appender();
+    let first = appender.submit(b"first")?;
+    let second = appender.submit(b"second")?;
+    println!("{} {}", first.wait()?, second.wait()?);
+    writer.shutdown()?;
+    Ok(())
+}
+```
+
+`submit` blocks if the queue is full and returns a receipt after enqueueing.
+Only a successful `wait` acknowledges durability. Dropping a receipt does not
+cancel the write. Calls from one producer retain order; concurrent producers are
+ordered by the queue, and returned offsets identify their positions in the file.
+
+Defaults are 128 queued records, up to 64 records per batch, and a 2 ms collection
+window. `GroupOptions` adjusts these; queue and batch capacities must be nonzero.
+The window starts when the worker receives a batch's first record. Queueing, disk
+I/O, scheduling, and sync time add to caller latency. A zero window skips waiting
+for more work. Payloads retain the same 1 MiB limit.
+
+`shutdown` queues a stop marker, commits earlier requests, joins the worker, and
+releases the lock. Finish producers before calling it: submissions racing the
+marker may receive `Closed`. Dropping the owner also drains and joins, but cannot
+report errors; use explicit shutdown when those errors matter. Cloned appenders
+can outlive the owner and will then reject submissions.
+
+Run a four-producer example, then inspect its records:
+
+```sh
+mkdir -p scratch
+cargo run --offline --example group_commit -- scratch/group.alog
+cargo run --offline -- inspect scratch/group.alog
+```
+
 ## Check
 
 ```sh
@@ -86,14 +131,14 @@ cargo fmt --check
 cargo clippy --offline --all-targets -- -D warnings
 ```
 
-Tests cover record boundaries, corrupt input, partial writes, failed syncs, and
-locks across processes. They exercise recovery logic and sync ordering, not power
-loss on a real device.
+Tests cover record boundaries, corrupt input, partial writes, failed syncs,
+concurrent producers, batch barriers, shutdown, and killed writers. They exercise
+recovery logic and sync ordering, not power loss on a real device.
 
 ## Limits
 
-One file, one writer, no rotation, index, or group commit. Readers hold shared
-locks and exclude writers for their lifetime. Locks are advisory on Linux: other
+One file, one writer, no rotation or index. Readers hold shared locks and exclude
+writers for their lifetime. Locks are advisory on Linux: other
 programs must cooperate, and the path must not be replaced while a handle is open.
 
 Opening either handle scans the whole file. A reader then reads the records again;

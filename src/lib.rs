@@ -1,10 +1,12 @@
 mod format;
+mod group;
 mod storage;
 
 #[cfg(test)]
 #[path = "../tests/support/mod.rs"]
 mod test_support;
 
+pub use group::{Commit, CommitError, GroupAppender, GroupOptions, GroupWriter};
 pub use storage::{Reader, Writer};
 
 use std::{fmt, io};
