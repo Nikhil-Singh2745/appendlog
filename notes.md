@@ -116,6 +116,14 @@ API. These tests check poisoning, barrier placement, and reopen behavior.
 CLI tests run another process while a parent handle holds a lock. This checks
 that exclusion isn't just enforced by mutable Rust references.
 
+The process-crash tests kill a writer with SIGKILL after it reports three records
+past a sync barrier: per-record sync with `Always`, or an explicit batch sync with
+`Manual`. The parent checks exclusion before the kill, then verifies the exact
+records and offsets, no discarded tail, and an append at the recovered boundary.
+A pipe handshake fixes the kill point; it doesn't depend on a sleep. This covers
+lock release and reopening after process death. The kernel stays running, so it
+doesn't establish power-loss durability or exercise a kill halfway through a write.
+
 There are no benchmark numbers yet. The next useful performance question is the
 cost of one sync per append against explicit batches, using a stated filesystem,
 payload distribution, and batch size.
