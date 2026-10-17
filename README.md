@@ -3,10 +3,10 @@
 A small Rust append log. I wanted to work through the acknowledgment and recovery
 rules before adding segments or a service around it.
 
-The current version is a library and CLI over one file. Records carry a bounded
-length and checksums for both the header and payload. Opening a writer validates
-the complete log, then removes an incomplete final record. Checksum failures are
-errors; they don't trigger repair.
+The library and CLI support single files and directory-based segmented logs.
+Records carry a bounded length and checksums for both the header and payload.
+Opening a writer validates the complete log, then removes an incomplete final
+record. Checksum failures are errors; they don't trigger repair.
 
 ## Run
 
@@ -123,6 +123,76 @@ cargo run --offline --example group_commit -- scratch/group.alog
 cargo run --offline -- inspect scratch/group.alog
 ```
 
+## Segmented logs
+
+The directory API rotates files while keeping positions explicit: a `LogPosition`
+contains a segment ID and a byte offset inside that segment. Each segment uses
+the same v1 framing as the single-file API. Existing files aren't migrated.
+
+```rust
+use appendlog::{SegmentedOptions, SegmentedReader, SegmentedWriter};
+
+fn main() -> Result<(), appendlog::Error> {
+    // Create this dedicated directory before opening it.
+    let (mut writer, recovery) = SegmentedWriter::open(
+        "scratch/segments", SegmentedOptions::default(),
+    )?;
+    let position = writer.append(b"hello")?;
+    println!("{}:{} discarded={}", position.segment_id, position.offset,
+        recovery.discarded_bytes);
+    drop(writer);
+
+    let mut reader = SegmentedReader::open("scratch/segments")?;
+    while let Some(record) = reader.next_record()? {
+        println!("{:?}: {:?}", record.position, record.payload);
+    }
+    Ok(())
+}
+```
+
+Defaults are a 64 MiB segment limit and `Always` sync. Set `max_segment_bytes`
+and `sync_policy` in `SegmentedOptions` to change them. The limit includes both
+headers and must be at least 28 bytes. A frame that doesn't fit rotates first,
+unless the current segment is empty: one valid frame may exceed the limit.
+Settings apply to that writer open; they aren't stored in the directory.
+
+```sh
+mkdir -p scratch/segments
+cargo run --offline -- init-dir scratch/segments
+cargo run --offline -- append-dir scratch/segments hello --segment-bytes 50
+cargo run --offline -- append-dir scratch/segments world --segment-bytes 50
+cargo run --offline -- append-dir scratch/segments '!' --segment-bytes 50
+cargo run --offline -- read-dir scratch/segments
+cargo run --offline -- inspect-dir scratch/segments
+```
+
+The first two frames exactly fill segment zero; the third starts segment one.
+`read-dir` prints `segment_id:offset<TAB>hex`:
+
+```text
+0:16	68656c6c6f
+0:33	776f726c64
+1:16	21
+```
+
+Rotation syncs the old segment, writes and syncs a new header through `.pending`,
+renames it to its final name, then syncs the directory before appending the next
+record. This also syncs preceding records under `Manual`; the new record still
+requires an explicit `sync`. Drop adds no barrier.
+
+Opening a writer validates every published segment before cleaning staging or
+repairing the active tail. Older incomplete segments and checksum failures are
+errors. Opening a reader validates everything before yielding records and never
+repairs anything. Inspection exposes a `SegmentInspection` per file; recovery
+reports totals including each file's header, active segment ID, discarded bytes,
+and whether unpublished staging was removed.
+
+Use a dedicated directory: only `LOCK`, `.pending`, and canonical segment files
+are accepted. Names start at `00000000000000000000.alog` and must be contiguous.
+One directory writer excludes all directory readers; multiple readers can share
+the lock. Don't use the single-file API to edit or read individual segments while
+directory handles are open: it doesn't participate in the directory lock.
+
 ## Check
 
 ```sh
@@ -132,18 +202,22 @@ cargo clippy --offline --all-targets -- -D warnings
 ```
 
 Tests cover record boundaries, corrupt input, partial writes, failed syncs,
-concurrent producers, batch barriers, shutdown, and killed writers. They exercise
-recovery logic and sync ordering, not power loss on a real device.
+concurrent producers, batch barriers, shutdown, interrupted rotation, and killed
+writers. They exercise recovery logic and sync ordering, not power loss on a real
+device.
 
 ## Limits
 
-One file, one writer, no rotation or index. Readers hold shared locks and exclude
-writers for their lifetime. Locks are advisory on Linux: other
+One writer per log, no retention, seeking, or index. Group commit currently uses
+the single-file writer. Readers hold shared locks and exclude writers for their
+lifetime. Locks are advisory on Linux: other
 programs must cooperate, and the path must not be replaced while a handle is open.
 
-Opening either handle scans the whole file. A reader then reads the records again;
-memory stays bounded by record size. That's a deliberate starting point, but it
-won't scale to large logs.
+Opening either kind of handle scans the whole log. A reader then reads the records
+again; payload memory stays bounded by record size. Directory handles also retain
+metadata proportional to segment count, but don't keep every segment file open.
+Startup still won't scale to large logs. Missing or renamed final segments and
+truncation exactly at a record boundary need external metadata to detect.
 
 The [format and recovery notes](notes.md) explain which damaged tails can be
 repaired and what the checksums can't establish.

@@ -3,6 +3,6 @@ name = "appendlog"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-description = "A single-file append log with checksums and tail recovery"
+description = "An append log with checksums, segment rotation, and tail recovery"
 
 [dependencies]

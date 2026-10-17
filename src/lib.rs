@@ -1,5 +1,6 @@
 mod format;
 mod group;
+mod segmented;
 mod storage;
 
 #[cfg(test)]
@@ -7,6 +8,10 @@ mod storage;
 mod test_support;
 
 pub use group::{Commit, CommitError, GroupAppender, GroupOptions, GroupWriter};
+pub use segmented::{
+    LogPosition, SegmentInspection, SegmentedOptions, SegmentedReader, SegmentedRecord,
+    SegmentedRecoveryReport, SegmentedWriter,
+};
 pub use storage::{Reader, Writer};
 
 use std::{fmt, io};
@@ -62,6 +67,8 @@ pub enum Error {
     Corrupt { offset: u64, reason: &'static str },
     PayloadTooLarge { len: usize },
     Poisoned,
+    InvalidLayout(String),
+    Segment { segment_id: u64, source: Box<Error> },
 }
 
 impl fmt::Display for Error {
@@ -77,6 +84,8 @@ impl fmt::Display for Error {
                 write!(f, "payload is {len} bytes; limit is {MAX_PAYLOAD}")
             }
             Self::Poisoned => f.write_str("writer failed earlier; close it and reopen the log"),
+            Self::InvalidLayout(reason) => write!(f, "invalid log directory: {reason}"),
+            Self::Segment { segment_id, source } => write!(f, "segment {segment_id}: {source}"),
         }
     }
 }
@@ -85,6 +94,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::Segment { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }

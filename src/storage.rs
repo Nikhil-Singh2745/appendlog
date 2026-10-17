@@ -66,6 +66,26 @@ impl Writer {
     pub fn sync(&mut self) -> Result<(), Error> {
         self.appender.sync()
     }
+
+    pub(crate) fn from_validated(
+        mut file: File,
+        policy: SyncPolicy,
+        next_offset: u64,
+    ) -> Result<Self, Error> {
+        file.seek(SeekFrom::Start(next_offset))?;
+        Ok(Self {
+            appender: Appender {
+                sink: file,
+                policy,
+                next_offset,
+                poisoned: false,
+            },
+        })
+    }
+
+    pub(crate) fn next_offset(&self) -> u64 {
+        self.appender.next_offset
+    }
 }
 
 pub struct Reader {
@@ -146,7 +166,7 @@ fn open_for_write(path: &Path) -> io::Result<(File, bool)> {
     }
 }
 
-fn lock(result: Result<(), TryLockError>) -> Result<(), Error> {
+pub(crate) fn lock(result: Result<(), TryLockError>) -> Result<(), Error> {
     match result {
         Ok(()) => Ok(()),
         Err(TryLockError::WouldBlock) => Err(Error::Busy),
@@ -154,7 +174,7 @@ fn lock(result: Result<(), TryLockError>) -> Result<(), Error> {
     }
 }
 
-fn scan(file: &mut File) -> Result<Inspection, Error> {
+pub(crate) fn scan(file: &mut File) -> Result<Inspection, Error> {
     let file_bytes = file.metadata()?.len();
     if file_bytes < FILE_HEADER_LEN {
         return Err(Error::InvalidHeader("incomplete file header"));
